@@ -6,8 +6,17 @@ const path = require("path");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpeg_static = require("ffmpeg-static");
 const ytsr = require("ytsr");
+const io = require("socket.io")(3002, {
+  cors: {
+    origin: "http://localhost:3000",
+  },
+});
 
 const cors = require("cors");
+
+io.on("connection", (socket) => {
+  console.log(socket.id);
+});
 
 const app = express();
 app.use(cors({ origin: "http://localhost:3000" }));
@@ -104,7 +113,6 @@ app.get("/mp3", async (req, res) => {
   writeStream.on("finish", async () => {
     try {
       await convertMp4ToMp3(tempMp4Path, outputPath);
-
       res.setHeader("Content-Type", "audio/mp3");
       res.setHeader(
         "Content-Disposition",
@@ -119,12 +127,19 @@ app.get("/mp3", async (req, res) => {
       audioStream.pipe(res);
 
       res.on("finish", () => {
-        fs.unlink(outputPath, (err) => {
-          if (err) {
-            console.error("Error deleting MP3 file:", err);
-          } else {
-            console.log("MP3 file deleted successfully");
-          }
+        if (fs.existsSync(outputPath)) {
+          fs.unlink(outputPath, (err) => {
+            if (err) {
+              console.error("Error deleting MP3 file:", err);
+            } else {
+              console.log("MP3 file deleted successfully");
+            }
+          });
+        } else {
+          console.log("MP3 file does not exist, skipping deletion");
+        }
+
+        if (fs.existsSync(tempMp4Path)) {
           fs.unlink(tempMp4Path, (err) => {
             if (err) {
               console.error("Error deleting MP4 file:", err);
@@ -132,7 +147,9 @@ app.get("/mp3", async (req, res) => {
               console.log("MP4 file deleted successfully");
             }
           });
-        });
+        } else {
+          console.log("MP4 file does not exist, skipping deletion");
+        }
       });
     } catch (err) {
       console.error("Error during conversion:", err);
@@ -264,10 +281,20 @@ app.get("/search", async (req, res) => {
   }
 });
 
-async function convertMp4ToMp3(inputPath, outputPath) {
+async function convertMp4ToMp3(inputPath, outputPath, ws) {
+  let totalTime;
   return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
       .audioCodec("libmp3lame")
+      .on("codecData", (data) => {
+        totalTime = parseInt(data.duration.replace(/:/g, ""));
+      })
+      .on("progress", (progress) => {
+        const time = parseInt(progress.timemark.replace(/:/g, ""));
+        const percent = (time / totalTime) * 100;
+        console.log(percent);
+        io.emit("progress", percent);
+      })
       .save(outputPath)
       .on("end", () => {
         console.log("MP4 to MP3 conversion complete");

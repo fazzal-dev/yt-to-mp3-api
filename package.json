@@ -11,11 +11,11 @@
   "license": "ISC",
   "dependencies": {
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "ffmpeg": "^0.0.4",
     "ffmpeg-static": "^5.2.0",
     "fluent-ffmpeg": "^2.1.2",
+    "socket.io": "^4.7.5",
     "ytdl-core": "^4.11.5",
     "ytsr": "^3.8.4"
   }
