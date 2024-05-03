@@ -14,9 +14,7 @@ const io = require("socket.io")(3002, {
 
 const cors = require("cors");
 
-io.on("connection", (socket) => {
-  console.log(socket.id);
-});
+io.on("connection", (socket) => {});
 
 const app = express();
 app.use(cors({ origin: "http://localhost:3000" }));
@@ -73,9 +71,9 @@ app.get("/", async (req, res) => {
       title: videoTitle,
       thumbnail: thumbnailUrl,
       duration: duration,
-      // formats,
-      mp4Formats,
-      mp3Format,
+      formats,
+      // mp4Formats,
+      // mp3Format,
     });
   } catch (err) {
     console.error("Error:", err);
@@ -105,6 +103,19 @@ app.get("/mp3", async (req, res) => {
   );
 
   const writeStream = fs.createWriteStream(tempMp4Path);
+  let downloadedSize = 0;
+  let totalSize = parseInt(videoInfo.formats[0].contentLength);
+  let downloadProgress = 0;
+  videoStream.on("data", (chunk) => {
+    downloadedSize += chunk.length;
+
+    const progress = (downloadedSize / totalSize) * 100;
+    if (Math.floor(progress) !== downloadProgress) {
+      downloadProgress = Math.floor(progress);
+      io.emit("downloadProgress", downloadProgress); // Emit download progress to client
+      console.log("Download Progress:", downloadProgress + "%");
+    }
+  });
   videoStream.pipe(writeStream);
   videoStream.on("end", () => {
     console.log("Video downloaded successfully");
@@ -292,8 +303,8 @@ async function convertMp4ToMp3(inputPath, outputPath, ws) {
       .on("progress", (progress) => {
         const time = parseInt(progress.timemark.replace(/:/g, ""));
         const percent = (time / totalTime) * 100;
-        console.log(percent);
         io.emit("progress", percent);
+        // console.log("Progress:", percent + "%");
       })
       .save(outputPath)
       .on("end", () => {
