@@ -219,12 +219,7 @@ app.get("/mp4", async (req, res) => {
       `attachment; filename="${sanitizedTitle}.mp4"`
     );
 
-    const videoStream = fs.createReadStream(outputPath);
-    videoStream.pipe(res);
-    videoStream.on("error", (err) => {
-      console.error("Error reading MP4 file:", err);
-      res.status(500).json({ error: "Error reading MP4 file" });
-    });
+    res.download(outputPath);
 
     res.on("finish", () => {
       fs.unlink(outputPath, (err) => {
