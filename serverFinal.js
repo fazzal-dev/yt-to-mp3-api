@@ -7,24 +7,12 @@ const ffmpeg = require("fluent-ffmpeg");
 const ffmpeg_static = require("ffmpeg-static");
 const ytsr = require("ytsr");
 const cors = require("cors");
-const jwt = require("jsonwebtoken");
-const dotenv = require("dotenv");
-const { title } = require("process");
-
-dotenv.config();
-
-//const tempDir = path.join(__dirname, "temp");
-//if (!fs.existsSync(tempDir)) {
-//  fs.mkdir(tempDir);
-//}
 
 const io = require("socket.io")(3002, {
   cors: {
     origin: "*",
   },
 });
-
-const secretKey = "password";
 
 const app = express();
 app.use(cors({ origin: "*" }));
@@ -35,13 +23,14 @@ const ffprobePath = "C:/ffmpeg/bin/ffprobe.exe";
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
 
+
 app.get("/", async (req, res) => {
   try {
     const { videoId } = req.query;
     if (!videoId) {
       return res.status(400).json({ error: "Missing required parameters" });
     }
-    const { videoTitle, videoInfo } = await getVideoInfo(videoId);
+    const { videoTitle,videoInfo } = await getVideoInfo(videoId);
     const thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
     const duration = formatDuration(videoInfo.videoDetails.lengthSeconds);
     const formats = videoInfo.formats;
@@ -84,12 +73,11 @@ app.get("/", async (req, res) => {
 
 io.on("connection", async (socket) => {
   // console.log("User connected:", socket.id);
-  socket.emit("secretkey", "password");
   socket.on("downloadMp3", async (data) => {
     try {
-      const payload = jwt.verify(data, secretKey);
       const { fileName, sanitizedTitle, videoTitle, videoUrl } =
-        await getVideoInfo(payload.id);
+        await getVideoInfo(data.videoId);
+      console.log(fileName, sanitizedTitle, videoTitle, videoUrl);
       const outputPath = path.join(__dirname, "audios", fileName);
       const writeStream = fs.createWriteStream(outputPath);
       const audio = ytdl(videoUrl, { quality: "highest", filter: "audioonly" });
@@ -102,23 +90,7 @@ io.on("connection", async (socket) => {
       audio.pipe(writeStream);
       audio.on("finish", () => {
         console.log("Conversion to Mp3 Complete");
-        const token = jwt.sign(
-          {
-            title: videoTitle,
-            mp3FileName: fileName,
-          },
-          secretKey
-        );
-        io.emit(
-          "finish",
-          jwt.sign(
-            {
-              videoTitle,
-              url: `http://162.55.212.83:3001/download/${token}`,
-            },
-            secretKey
-          )
-        );
+        socket.emit("finish");
       });
     } catch (error) {
       console.error("Error fetching video info:", error);
@@ -126,23 +98,28 @@ io.on("connection", async (socket) => {
   });
 });
 
-app.get("/download/:token", async (req, res) => {
-  try {
-    const data = req.params.token;
-    const payload = jwt.verify(data, secretKey);
-    // const { fileName, videoTitle } = await getVideoInfo(data.id);
-    const outputPath = path.join(__dirname, "audios", payload.fileName);
 
-    res.download(outputPath, `ytmp3 - ${payload.videoTitle}.mp3`, {
-      headers: {
-        "Content-Type": "audio/mpeg",
-      },
-    });
+app.get("/download", async (req, res) => {
+  const { videoId } = req.query;
+  if (!videoId) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+
+  try {
+    const { fileName, videoTitle } = await getVideoInfo(videoId);
+    const outputPath = path.join(__dirname, "audios", fileName);
+	
+	res.download(outputPath, `ytmp3 - ${videoTitle}.mp3`, {
+            headers: {
+              "Content-Type": "audio/mpeg",
+            },
+          });
   } catch (err) {
     console.error("Error:", err);
     res.status(500).json({ error: "An error occurred" });
   }
 });
+
 
 app.get("/mp4", async (req, res) => {
   try {
@@ -272,7 +249,7 @@ async function getVideoInfo(videoId) {
   const videoTitle = videoInfo.videoDetails.title;
   const sanitizedTitle = videoTitle.replace(/[^\w\s]/g, "");
   const fileName = `${sanitizedTitle}.mp3`;
-  return { videoInfo, videoTitle, sanitizedTitle, fileName, videoUrl };
+  return { videoInfo, videoTitle, sanitizedTitle, fileName,videoUrl };
 }
 
 function formatDuration(durationInSeconds) {
