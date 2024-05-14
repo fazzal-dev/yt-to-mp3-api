@@ -1,22 +1,26 @@
 const express = require("express");
 const ytdl = require("ytdl-core");
-const cp = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const ffmpeg = require("fluent-ffmpeg");
-const ffmpeg_static = require("ffmpeg-static");
 const ytsr = require("ytsr");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
+const requestIp = require("request-ip");
 const dotenv = require("dotenv");
-const { title } = require("process");
+const tempDir = path.join(__dirname, "temp");
+const geoip = require("geoip-lite");
 
 dotenv.config();
+ffmpeg.setFfmpegPath("/usr/bin/ffmpeg");
 
-//const tempDir = path.join(__dirname, "temp");
-//if (!fs.existsSync(tempDir)) {
-//  fs.mkdir(tempDir);
-//}
+if (!fs.existsSync(tempDir)) {
+  try {
+    fs.mkdir(tempDir);
+  } catch (err) {
+    console.error(`Error creating directory: ${err.message}`);
+  }
+}
 
 const io = require("socket.io")(3002, {
   cors: {
@@ -24,16 +28,19 @@ const io = require("socket.io")(3002, {
   },
 });
 
-const secretKey = "password";
+const SECRET_KEY = process.env.SECRET_KEY;
 
 const app = express();
 app.use(cors({ origin: "*" }));
 const PORT = 3001;
 
-const ffmpegPath = "C:/ffmpeg/bin/ffmpeg.exe";
-const ffprobePath = "C:/ffmpeg/bin/ffprobe.exe";
-ffmpeg.setFfmpegPath(ffmpegPath);
-ffmpeg.setFfprobePath(ffprobePath);
+app.use((req, res, next) => {
+  const ip = req.clientIp;
+  const geo = geoip.lookup(ip);
+  const country = geo ? geo.country : "Unknown";
+  req.clientCountry = country;
+  next();
+});
 
 app.get("/", async (req, res) => {
   try {
@@ -83,31 +90,38 @@ app.get("/", async (req, res) => {
 });
 
 io.on("connection", async (socket) => {
-  // console.log("User connected:", socket.id);
-  socket.emit("secretkey", "password");
+  const ip = socket.request.connection.remoteAddress;
+  const geo = geoip.lookup(ip);
+  const country = geo ? geo.country : "Unknown";
+
+  const logMessage = `User connected: ${socket.id}\nCountry: ${country}`;
+  printBoxedLog(logMessage);
+
+  socket.emit("secretkey", SECRET_KEY);
   socket.on("downloadMp3", async (data) => {
     try {
-      const payload = jwt.verify(data, secretKey);
-      const { fileName, sanitizedTitle, videoTitle, videoUrl } =
-        await getVideoInfo(payload.id);
-      const outputPath = path.join(__dirname, "audios", fileName);
+      const payload = jwt.verify(data, SECRET_KEY);
+      const { videoTitle, videoUrl } = await getVideoInfo(payload.id);
+      const outputPath = `${tempDir}/${Date.now()}${Math.round(
+        Math.random() * 1e9
+      )}-${payload.id}.mp3`;
       const writeStream = fs.createWriteStream(outputPath);
       const audio = ytdl(videoUrl, { quality: "highest", filter: "audioonly" });
 
       audio.on("progress", (_, downloaded, total) => {
         const percent = ((downloaded / total) * 100).toFixed(1);
-        console.log(percent);
         io.emit("progress", percent);
       });
       audio.pipe(writeStream);
       audio.on("finish", () => {
         console.log("Conversion to Mp3 Complete");
+        const fileName = path.basename(outputPath);
         const token = jwt.sign(
           {
             title: videoTitle,
-            mp3FileName: fileName,
+            fileName: fileName,
           },
-          secretKey
+          SECRET_KEY
         );
         io.emit(
           "finish",
@@ -116,7 +130,7 @@ io.on("connection", async (socket) => {
               videoTitle,
               url: `http://162.55.212.83:3001/download/${token}`,
             },
-            secretKey
+            SECRET_KEY
           )
         );
       });
@@ -124,113 +138,155 @@ io.on("connection", async (socket) => {
       console.error("Error fetching video info:", error);
     }
   });
+  socket.on("downloadMp4", async (data) => {
+    try {
+      const payload = jwt.verify(data, SECRET_KEY);
+      if (!payload.id) {
+        socket.emit("error", { error: "Missing videoId parameter" });
+        return;
+      }
+      const videoUrl = `https://www.youtube.com/watch?v=${payload.id}`;
+
+      const { videoTitle } = await getVideoInfo(payload.id);
+
+      const audio = ytdl(videoUrl, { quality: "highestaudio" });
+      const video = ytdl(videoUrl, { quality: "highestvideo" });
+
+      const filePathBase = `${tempDir}/${Date.now()}${Math.round(
+        Math.random() * 1e9
+      )}-${payload.id}`;
+      const audioPath = `${filePathBase}-audio.mp3`;
+      const videoPath = `${filePathBase}-video.mp4`;
+      const outputPath = `${filePathBase}.mp4`;
+
+      audio.pipe(fs.createWriteStream(audioPath));
+      video.pipe(fs.createWriteStream(videoPath));
+
+      let audioDownloaded = false;
+      let videoDownloaded = false;
+
+      audio.on("end", () => {
+        console.log("Audio downloaded");
+        audioDownloaded = true;
+        checkIfDownloaded();
+      });
+
+      video.on("end", () => {
+        console.log("Video downloaded");
+        videoDownloaded = true;
+        checkIfDownloaded();
+      });
+
+      function checkIfDownloaded() {
+        if (audioDownloaded && videoDownloaded) {
+          console.log("Start merging");
+          ffmpeg()
+            .input(audioPath)
+            .input(videoPath)
+            .outputOptions(["-c:v copy", "-c:a aac", "-strict experimental"])
+            .on("progress", (progress) => {
+              console.log("Merging progress:", progress.percent);
+              socket.emit("progress", progress.percent);
+            })
+            .on("end", () => {
+              console.log("Merging completed");
+              const fileName = path.basename(outputPath);
+              const token = jwt.sign(
+                {
+                  title: videoTitle,
+                  fileName: fileName,
+                },
+                SECRET_KEY
+              );
+              socket.emit(
+                "finish",
+                jwt.sign(
+                  {
+                    videoTitle,
+                    url: `http://162.55.212.83:3001/download/${token}`,
+                  },
+                  SECRET_KEY
+                )
+              );
+              deleteFile(audioPath);
+              deleteFile(videoPath);
+            })
+            .on("error", (err) => {
+              console.error("Error during merging:", err);
+              socket.emit("error", {
+                error: "An error occurred during merging",
+              });
+              deleteFile(audioPath);
+              deleteFile(videoPath);
+            })
+            .save(outputPath);
+        }
+      }
+    } catch (err) {
+      console.error("Error:", err);
+      socket.emit("error", { error: "An error occurred" });
+    }
+  });
 });
 
 app.get("/download/:token", async (req, res) => {
   try {
-    const data = req.params.token;
-    const payload = jwt.verify(data, secretKey);
-    // const { fileName, videoTitle } = await getVideoInfo(data.id);
-    const outputPath = path.join(__dirname, "audios", payload.fileName);
+    const { format } = req.query;
+    const payload = await jwt.verify(req.params.token, SECRET_KEY);
+    const filePath = `${tempDir}/${payload.fileName}`;
 
-    res.download(outputPath, `ytmp3 - ${payload.videoTitle}.mp3`, {
-      headers: {
-        "Content-Type": "audio/mpeg",
-      },
-    });
-  } catch (err) {
-    console.error("Error:", err);
-    res.status(500).json({ error: "An error occurred" });
-  }
-});
-
-app.get("/mp4", async (req, res) => {
-  try {
-    const { videoId } = req.query;
-    if (!videoId) {
-      return res.status(400).json({ error: "Missing videoId parameter" });
+    const ip = req.headers["x-forwarded-for"] || req.connection.remoteAddress;
+    const geo = geoip.lookup(ip);
+    const country = geo ? geo.country : "Unknown";
+    const message = `File downloaded: ${payload.title}\nUser country: ${country}`;
+    printBoxedLog(message);
+    if (format === "mp4") {
+      res.download(
+        filePath,
+        `${process.env.DOMAIN} - ${payload.title}.mp4`,
+        (err) => {
+          if (err) {
+            deleteFile(filePath);
+            console.error("Error downloading file:", err);
+            if (!res.headersSent) {
+              deleteFile(filePath);
+              res
+                .status(500)
+                .json({ error: "An error occurred while downloading" });
+            }
+          } else {
+            console.log("File downloaded successfully");
+          }
+        }
+      );
+    } else if (format === "mp3") {
+      res.download(
+        filePath,
+        `${process.env.DOMAIN} - ${payload.title}.mp3`,
+        (err) => {
+          if (err) {
+            deleteFile(filePath);
+            console.error("Error downloading file:", err);
+            if (!res.headersSent) {
+              deleteFile(filePath);
+              res
+                .status(500)
+                .json({ error: "An error occurred while downloading" });
+            }
+          } else {
+            console.log("File downloaded successfully");
+          }
+        }
+      );
+    } else {
+      res.status(400).json({ error: "Invalid format. Use 'mp3' or 'mp4'." });
     }
-    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-
-    const videoInfo = await ytdl.getInfo(videoUrl);
-    const videoTitle = videoInfo.videoDetails.title;
-    const sanitizedTitle = videoTitle.replace(/[^\w]/g, "");
-
-    const audio = ytdl(videoUrl, { quality: "highestaudio" });
-    const video = ytdl(videoUrl, { quality: "highestvideo" });
-    const outputPath = path.join(__dirname, "videos", `${sanitizedTitle}.mp4`);
-
-    const ffmpegProcess = cp.spawn(
-      ffmpeg_static,
-      [
-        "-y",
-        "-loglevel",
-        "8",
-        "-hide_banner",
-        "-progress",
-        "pipe:3",
-        "-i",
-        "pipe:4",
-        "-i",
-        "pipe:5",
-        "-map",
-        "0:a",
-        "-map",
-        "1:v",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-strict",
-        "experimental",
-        outputPath,
-      ],
-      {
-        windowsHide: true,
-        stdio: ["inherit", "inherit", "inherit", "pipe", "pipe", "pipe"],
-      }
-    );
-
-    ffmpegProcess.stdio[3].on("data", (chunk) => {
-      const lines = chunk.toString().trim().split("\n");
-      const args = {};
-      for (const l of lines) {
-        const [key, value] = l.split("=");
-        args[key.trim()] = value.trim();
-      }
-    });
-
-    audio.pipe(ffmpegProcess.stdio[4]);
-    video.pipe(ffmpegProcess.stdio[5]);
-
-    await new Promise((resolve, reject) => {
-      ffmpegProcess.on("close", () => {
-        console.log("Mp4 downloaded successfully");
-        resolve();
-      });
-      ffmpegProcess.on("error", (err) => {
-        reject(err);
-      });
-    });
-
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${sanitizedTitle}.mp4"`
-    );
-
-    res.download(outputPath);
 
     res.on("finish", () => {
-      fs.unlink(outputPath, (err) => {
-        if (err) {
-          console.error("Error deleting MP4 file:", err);
-        } else {
-          console.log("MP4 file deleted successfully");
-        }
-      });
+      deleteFile(filePath);
     });
   } catch (err) {
+    deleteFile(filePath);
     console.error("Error:", err);
     res.status(500).json({ error: "An error occurred" });
   }
@@ -243,9 +299,8 @@ app.get("/search", async (req, res) => {
       return res.status(400).json({ error: "Missing keyword parameter" });
     }
     const sanitizedKeyword = keyword.replace(/\s+/g, "");
-    console.log(sanitizedKeyword);
 
-    const searchResults = await ytsr(sanitizedKeyword, { limit: 10 });
+    const searchResults = await ytsr(sanitizedKeyword, { limit: 20 });
     const videos = searchResults.items
       .filter((item) => item.type === "video")
       .map((item) => ({
@@ -265,9 +320,23 @@ async function getVideoInfo(videoId) {
   const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const videoInfo = await ytdl.getInfo(videoUrl);
   const videoTitle = videoInfo.videoDetails.title;
-  const sanitizedTitle = videoTitle.replace(/[^\w\s]/g, "");
+  const sanitizedTitle = videoTitle.replace(/[^\w]/g, "");
   const fileName = `${sanitizedTitle}.mp3`;
   return { videoInfo, videoTitle, sanitizedTitle, fileName, videoUrl };
+}
+
+function deleteFile(filePath) {
+  fs.access(filePath, fs.constants.F_OK, (accessErr) => {
+    if (!accessErr) {
+      fs.unlink(filePath, (unlinkErr) => {
+        if (unlinkErr) {
+          console.error("Error deleting file:", unlinkErr);
+        } else {
+          console.log("File deleted successfully");
+        }
+      });
+    }
+  });
 }
 
 function formatDuration(durationInSeconds) {
@@ -275,6 +344,35 @@ function formatDuration(durationInSeconds) {
   const seconds = durationInSeconds % 60;
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
+
+const printBoxedLog = (message) => {
+  const boxWidth = 60;
+  const horizontalLine = "-".repeat(boxWidth);
+  const emptyLine = "|" + " ".repeat(boxWidth - 2) + "|";
+
+  const now = new Date();
+  const dateTime = now.toLocaleString();
+
+  const fullMessage = `[${dateTime}]\n${message}`;
+  const wrappedMessage = fullMessage
+    .match(new RegExp(".{1," + (boxWidth - 4) + "}", "g"))
+    .map((line) => {
+      const padding = boxWidth - 2 - line.length;
+      return "|" + line + " ".repeat(padding) + "|";
+    })
+    .join("\n");
+
+  console.log(horizontalLine);
+  console.log(emptyLine);
+  console.log(wrappedMessage);
+  console.log(emptyLine);
+  console.log(horizontalLine);
+};
+
+// Example usage:
+printBoxedLog(
+  "This is a test message to demonstrate the boxed log with date and time."
+);
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
